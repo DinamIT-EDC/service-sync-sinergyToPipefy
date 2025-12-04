@@ -1,15 +1,77 @@
 // src/extractActiveCards.js
 const fs = require('fs');
 const {
-  PIPEFY_TOKEN,
   PIPEFY_ENDPOINT,
   PHASE_ATIVOS_ID,
   PAGE_SIZE,
   CARDS_JSON_FILE,
   DEBUG,
+  PIPEFY_CLIENT_ID,
+  PIPEFY_CLIENT_SECRET,
+  PIPEFY_TOKEN_URL,
 } = require('./env');
 
-async function fetchActiveCardsPage(afterCursor) {
+/**
+ * Busca um novo access_token OAuth no Pipefy usando client_credentials.
+ * Essa função é chamada uma vez por execução do script.
+ */
+async function getPipefyAccessToken() {
+  const tokenUrl = PIPEFY_TOKEN_URL || 'https://app.pipefy.com/oauth/token';
+
+  if (!PIPEFY_CLIENT_ID || !PIPEFY_CLIENT_SECRET) {
+    throw new Error(
+      'PIPEFY_CLIENT_ID ou PIPEFY_CLIENT_SECRET não configurados no .env'
+    );
+  }
+
+  const params = new URLSearchParams();
+  params.append('grant_type', 'client_credentials');
+  params.append('client_id', PIPEFY_CLIENT_ID);
+  params.append('client_secret', PIPEFY_CLIENT_SECRET);
+
+  if (DEBUG) {
+    console.log('🔐 Solicitando novo access_token ao Pipefy...');
+  }
+
+  const res = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: params,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(
+      `Erro ao obter token OAuth do Pipefy (${res.status}): ${text}`
+    );
+  }
+
+  const json = await res.json();
+
+  if (!json.access_token) {
+    throw new Error(
+      `Resposta OAuth do Pipefy não contém access_token: ${JSON.stringify(
+        json
+      )}`
+    );
+  }
+
+  if (DEBUG) {
+    console.log(
+      `✅ Novo access_token obtido. expires_in: ${json.expires_in} segundos`
+    );
+  }
+
+  return json.access_token;
+}
+
+/**
+ * Busca uma página de cards ativos na fase configurada.
+ * Agora recebe o accessToken como parâmetro.
+ */
+async function fetchActiveCardsPage(afterCursor, accessToken) {
   const query = `
     query GetActiveCards($phaseId: ID!, $pageSize: Int!, $after: String) {
       phase(id: $phaseId) {
@@ -51,7 +113,7 @@ async function fetchActiveCardsPage(afterCursor) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${PIPEFY_TOKEN}`,
+      Authorization: `Bearer ${accessToken}`, // 🔑 token OAuth da execução
     },
     body: JSON.stringify({ query, variables }),
   });
@@ -64,9 +126,14 @@ async function fetchActiveCardsPage(afterCursor) {
   const json = await res.json();
   if (json.errors && json.errors.length > 0) {
     if (DEBUG) {
-      console.error('Pipefy GraphQL errors:', JSON.stringify(json.errors, null, 2));
+      console.error(
+        'Pipefy GraphQL errors:',
+        JSON.stringify(json.errors, null, 2)
+      );
     }
-    throw new Error('Pipefy GraphQL returned errors when fetching active cards');
+    throw new Error(
+      'Pipefy GraphQL returned errors when fetching active cards'
+    );
   }
 
   const phase = json.data?.phase;
@@ -87,8 +154,15 @@ async function fetchActiveCardsPage(afterCursor) {
   };
 }
 
+/**
+ * Fluxo principal: obtém o token OAuth, pagina sobre os cards ativos
+ * e salva tudo em arquivo JSON.
+ */
 async function extractActiveCards() {
   console.log('📥 Fetching ACTIVE cards from Pipefy...');
+
+  // 🔐 1) Busca um token novo para esta execução
+  const accessToken = await getPipefyAccessToken();
 
   let allCards = [];
   let afterCursor = null;
@@ -98,7 +172,8 @@ async function extractActiveCards() {
     page += 1;
     console.log(`  ➜ Page ${page} (after: ${afterCursor || 'null'})`);
 
-    const { cards, hasNextPage, endCursor } = await fetchActiveCardsPage(afterCursor);
+    const { cards, hasNextPage, endCursor } =
+      await fetchActiveCardsPage(afterCursor, accessToken);
 
     console.log(`     Found ${cards.length} cards on this page.`);
     allCards = allCards.concat(cards);
@@ -109,7 +184,11 @@ async function extractActiveCards() {
 
   console.log(`\n✅ Total ACTIVE cards fetched: ${allCards.length}`);
 
-  fs.writeFileSync(CARDS_JSON_FILE, JSON.stringify(allCards, null, 2), 'utf8');
+  fs.writeFileSync(
+    CARDS_JSON_FILE,
+    JSON.stringify(allCards, null, 2),
+    'utf8'
+  );
   console.log(`💾 Saved to ${CARDS_JSON_FILE}\n`);
 }
 
