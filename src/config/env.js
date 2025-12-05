@@ -1,4 +1,4 @@
-// src/env.js
+// src/config/env.js
 require('dotenv').config();
 
 function requiredEnv(name) {
@@ -9,7 +9,7 @@ function requiredEnv(name) {
   return value;
 }
 
-// 🔐 Pipefy OAuth (novo)
+// 🔐 Pipefy OAuth
 const PIPEFY_CLIENT_ID     = requiredEnv('PIPEFY_CLIENT_ID');
 const PIPEFY_CLIENT_SECRET = requiredEnv('PIPEFY_CLIENT_SECRET');
 const PIPEFY_TOKEN_URL     = process.env.PIPEFY_TOKEN_URL || 'https://app.pipefy.com/oauth/token';
@@ -21,6 +21,9 @@ const PIPEFY_ENDPOINT = process.env.PIPEFY_ENDPOINT || 'https://api.pipefy.com/g
 const PHASE_ATIVOS_ID  = requiredEnv('PHASE_ATIVOS_ID');
 const PAGE_SIZE        = Number(process.env.PAGE_SIZE || '50');
 const CARDS_JSON_FILE  = process.env.CARDS_JSON_FILE || 'cards_ativos_raw.json';
+
+// Pipe/quadros do Pipefy
+const PIPE_ID = requiredEnv('PIPE_ID');
 
 const PHASE_INATIVOS_ID = process.env.PHASE_INATIVOS_ID || '';
 
@@ -53,6 +56,7 @@ module.exports = {
   PAGE_SIZE,
   CARDS_JSON_FILE,
   PHASE_INATIVOS_ID,
+  PIPE_ID,
 
   // 🔗 Sinergy SOAP
   SINERGY_ENDPOINT,

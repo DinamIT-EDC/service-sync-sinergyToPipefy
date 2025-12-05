@@ -44,6 +44,18 @@ function normalize(v) {
   return String(v).trim();
 }
 
+// 🔹 utilidade comum – pausa async
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 🔹 logger centralizado com flag – caso queira usar no futuro
+function createDebugLogger(enabled) {
+  return (...args) => {
+    if (enabled) console.log('[DEBUG]', ...args);
+  };
+}
+
 module.exports = {
   escapeXml,
   onlyDigits,
@@ -51,4 +63,8 @@ module.exports = {
   gqlEscape,
   toIsoDateOrOriginal,
   normalize,
+
+  // extras úteis (não interferem nos seus services)
+  sleep,
+  createDebugLogger,
 };

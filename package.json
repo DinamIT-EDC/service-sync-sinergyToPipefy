@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "extract:ativos": "node src/services/extractActiveCards.js",
+    "sync:existing": "node src/services/syncExistingCards.js",
+    "sync:new-employees": "node src/services/syncNewEmployees.js"
   },
   "keywords": [],
   "author": "",

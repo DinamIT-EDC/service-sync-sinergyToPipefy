@@ -1,24 +1,17 @@
-// src/syncExistingCards.js
+// src/services/syncExistingCards.js
 const fs = require('fs');
-const { XMLParser } = require('fast-xml-parser');
 const {
-  PIPEFY_TOKEN,
-  PIPEFY_ENDPOINT,
   CARDS_JSON_FILE,
-  SINERGY_ENDPOINT,
-  SINERGY_USER,
-  SINERGY_PASS,
-  SINERGY_SOAP_ACTION_BY_CPF,
-  DEBUG,
-} = require('./env');
+} = require('../config/env');
+const { callPipefy } = require('../infra/pipefyClient');
+const { getFuncionarioByCpf } = require('../infra/sinergyClient');
 const {
-  escapeXml,
   onlyDigits,
   formatCpfMask,
   gqlEscape,
   toIsoDateOrOriginal,
   normalize,
-} = require('./utils');
+} = require('../utils');
 
 // ================== MAPEAMENTOS ==================
 
@@ -98,32 +91,6 @@ const PIPEFY_CPF_LABEL = PIPEFY_LABEL_MAP.cpf;
 
 // ================== PIPEFY – FUNÇÕES ==================
 
-async function callPipefy(query, variables) {
-  const res = await fetch(PIPEFY_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${PIPEFY_TOKEN}`,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Pipefy HTTP error ${res.status}: ${text}`);
-  }
-
-  const json = await res.json();
-
-  if (json.errors && json.errors.length > 0) {
-    console.error('Pipefy GraphQL errors:', JSON.stringify(json.errors, null, 2));
-    throw new Error('Pipefy GraphQL returned errors');
-  }
-
-  return json.data;
-}
-
-// Atualiza campos usando múltiplos updateCardField em uma única mutation
 async function updateCardFields(cardId, canonicalData, diffKeys) {
   const operations = [];
 
@@ -194,110 +161,8 @@ function extractCpfDigitsFromCard(card) {
   return onlyDigits(field.value);
 }
 
-// ================== SINERGY – FUNÇÕES ===================
+// ================== SINERGY – CANÔNICO ===================
 
-const parserOpts = {
-  ignoreAttributes: false,
-  trimValues: true,
-  parseTagValue: false,
-  removeNSPrefix: true,
-};
-
-function buildEnvelopeByCpf(usuario, senha, cpfComMascara) {
-  return `<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Header>
-    <AuthSoapHd xmlns="http://tempuri.org/">
-      <Usuario>${escapeXml(usuario)}</Usuario>
-      <Senha>${escapeXml(senha)}</Senha>
-    </AuthSoapHd>
-  </soap:Header>
-  <soap:Body>
-    <getDadosFuncionariosPorCpf xmlns="http://tempuri.org/">
-      <cpf>${escapeXml(cpfComMascara)}</cpf>
-    </getDadosFuncionariosPorCpf>
-  </soap:Body>
-</soap:Envelope>`;
-}
-
-async function callSoap(envelope, soapAction) {
-  const res = await fetch(SINERGY_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'text/xml; charset=utf-8',
-      SOAPAction: soapAction,
-    },
-    body: envelope,
-  });
-
-  const xml = await res.text();
-
-  if (!res.ok) {
-    console.error(`❌ SOAP HTTP ${res.status} ${res.statusText}`);
-    console.error(xml.slice(0, 800));
-    throw new Error(`SOAP HTTP error ${res.status}`);
-  }
-
-  return xml;
-}
-
-function parseFuncionarioFromSoap(soapXml, cpfSolicitadoDigits) {
-  const parser = new XMLParser(parserOpts);
-  const soapObj = parser.parse(soapXml);
-
-  const body = soapObj?.Envelope?.Body;
-  if (!body) throw new Error('SOAP Body missing.');
-
-  if (body.Fault || body.fault) {
-    console.error('❌ SOAP Fault:', body.Fault || body.fault);
-    throw new Error('SOAP Fault returned by service.');
-  }
-
-  const result =
-    body?.getDadosFuncionariosPorCpfResponse?.getDadosFuncionariosPorCpfResult;
-
-  if (!result || typeof result !== 'string') {
-    if (DEBUG) {
-      console.log('[DEBUG] getDadosFuncionariosPorCpfResult missing or not string.');
-      console.dir(body, { depth: 5 });
-    }
-    return null;
-  }
-
-  const innerXml = result
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
-
-  const innerObj = parser.parse(innerXml);
-  const raiz = innerObj.Funcionarios ?? innerObj.funcionarios ?? innerObj;
-  let dados = raiz?.dadosFuncionario;
-
-  if (!dados) return null;
-
-  if (Array.isArray(dados)) {
-    const filtrado = dados.find(
-      (f) => onlyDigits(f.func_num_cpf) === cpfSolicitadoDigits
-    );
-    dados = filtrado || dados[0];
-  }
-
-  return dados || null;
-}
-
-async function getFuncionarioSinergyByCpf(cpfDigits) {
-  const mascara = formatCpfMask(cpfDigits);
-  const envelope = buildEnvelopeByCpf(SINERGY_USER, SINERGY_PASS, mascara);
-  const soapXml = await callSoap(envelope, SINERGY_SOAP_ACTION_BY_CPF);
-  const f = parseFuncionarioFromSoap(soapXml, cpfDigits);
-  return f;
-}
-
-// Monta objeto canônico a partir da Sinergy (espelhando criação de card)
 function buildCanonicalFromSinergy(funcData, cpfDigits) {
   const celularForm =
     funcData.func_num_cel ||
@@ -363,10 +228,6 @@ function findDifferences(canonicalPipefy, canonicalSinergy) {
 // ================== MAIN ==================
 
 async function syncExistingCards() {
-  if (!PIPEFY_TOKEN) throw new Error('PIPEFY_TOKEN not defined');
-  if (!SINERGY_USER || !SINERGY_PASS) {
-    throw new Error('SINERGY_USER or SINERGY_PASS not defined');
-  }
   if (!fs.existsSync(CARDS_JSON_FILE)) {
     throw new Error(`File ${CARDS_JSON_FILE} not found.`);
   }
@@ -402,10 +263,10 @@ async function syncExistingCards() {
         continue;
       }
 
-      // 1) Consulta Sinergy
+      // 1) Consulta Sinergy (via infra)
       let sinergyData;
       try {
-        sinergyData = await getFuncionarioSinergyByCpf(cpfDigits);
+        sinergyData = await getFuncionarioByCpf(cpfDigits);
       } catch (err) {
         console.error(
           `Error calling Sinergy for CPF ${formatCpfMask(cpfDigits)}:`,
@@ -427,7 +288,6 @@ async function syncExistingCards() {
 
       const canonicalSinergy = buildCanonicalFromSinergy(sinergyData, cpfDigits);
 
-      // Se quiser filtrar por status (ATV/DMT), pode manter:
       const status = normalize(canonicalSinergy.status_colaborador);
       if (!status) {
         console.log(
@@ -447,9 +307,6 @@ async function syncExistingCards() {
         ok++;
       } else {
         console.log(`Different fields: ${diffKeys.join(', ')}`);
-        if (DEBUG) {
-          console.log(JSON.stringify(diffs, null, 2));
-        }
 
         try {
           await updateCardFields(cardId, canonicalSinergy, diffKeys);
@@ -468,7 +325,6 @@ async function syncExistingCards() {
         `Unexpected error when processing card ${card.id}:`,
         err.message
       );
-      if (DEBUG) console.error(err);
       errors++;
     }
   }
@@ -483,7 +339,7 @@ async function syncExistingCards() {
   });
 }
 
-// Permite rodar direto: node src/syncExistingCards.js
+// Permite rodar direto: node src/services/syncExistingCards.js
 if (require.main === module) {
   syncExistingCards().catch((err) => {
     console.error('Fatal error in syncExistingCards:', err.message);
