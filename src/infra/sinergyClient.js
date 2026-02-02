@@ -1,5 +1,8 @@
 // src/infra/sinergyClient.js
 const { XMLParser } = require('fast-xml-parser');
+const fs = require('fs');
+const path = require('path');
+
 const {
   SINERGY_ENDPOINT,
   SINERGY_USER,
@@ -8,6 +11,7 @@ const {
   SINERGY_SOAP_ACTION_ATIVOS,
   DEBUG,
 } = require('../config/env');
+
 const {
   escapeXml,
   onlyDigits,
@@ -25,6 +29,39 @@ function logDebug(...args) {
   if (DEBUG) console.log('[Sinergy]', ...args);
 }
 
+function looksLikeHtml(str) {
+  const s = (str || '').trim().toLowerCase();
+  return s.startsWith('<!doctype html') || s.startsWith('<html');
+}
+
+function looksLikeBase64(str) {
+  const s = (str || '').trim();
+  // heurística simples: só caracteres base64 + tamanho razoável
+  if (!s || s.length < 40) return false;
+  return /^[A-Za-z0-9+/=\r\n]+$/.test(s);
+}
+
+function decodeInnerXml(str) {
+  return str
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+function saveDebugPayload(filename, content) {
+  if (!DEBUG) return;
+  try {
+    const outDir = path.join(process.cwd(), 'debug');
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, filename), content, 'utf8');
+    logDebug(`Payload salvo em debug/${filename}`);
+  } catch (e) {
+    logDebug('Falha ao salvar payload de debug:', e.message);
+  }
+}
+
 // ========== SOAP genérico ==========
 
 async function callSoap(envelope, soapAction) {
@@ -37,16 +74,32 @@ async function callSoap(envelope, soapAction) {
     headers: {
       'Content-Type': 'text/xml; charset=utf-8',
       SOAPAction: soapAction,
+      Accept: 'text/xml, application/xml, */*',
+      'User-Agent': 'service-sync-sinergyToPipefy/1.0',
     },
     body: envelope,
   });
 
   const xml = await res.text();
 
+  // Diagnóstico mesmo em 200 (quando DEBUG)
+  logDebug('HTTP', res.status, res.statusText);
+  logDebug('Content-Type', res.headers.get('content-type'));
+  logDebug('Body length', xml.length);
+  logDebug('Body head', xml.slice(0, 300));
+
   if (!res.ok) {
     console.error(`❌ [Sinergy] HTTP ${res.status} ${res.statusText}`);
     console.error(xml.slice(0, 800));
     throw new Error(`SOAP HTTP error ${res.status}`);
+  }
+
+  // Se começou a voltar HTML (bloqueio / WAF / página)
+  if (looksLikeHtml(xml)) {
+    saveDebugPayload('sinergy_html_response.html', xml);
+    throw new Error(
+      'Sinergy retornou HTML (possível bloqueio/WAF/proxy). Verifique status, IP de origem e regras do provedor.'
+    );
   }
 
   return xml;
@@ -89,19 +142,26 @@ function parseFuncionarioFromSoap(soapXml, cpfSolicitadoDigits) {
     body?.getDadosFuncionariosPorCpfResponse?.getDadosFuncionariosPorCpfResult;
 
   if (!result || typeof result !== 'string') {
-    logDebug(
-      'getDadosFuncionariosPorCpfResult ausente ou não-string. Body:',
-      body
+    // Antes retornava null silencioso; agora sobe erro (pra não mascarar)
+    saveDebugPayload('sinergy_bycpf_body.json', JSON.stringify(body, null, 2));
+    throw new Error(
+      'getDadosFuncionariosPorCpfResult ausente/não-string. Possível mudança de retorno, SOAPAction ou bloqueio.'
     );
-    return null;
   }
 
-  const innerXml = result
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
+  if (result.toLowerCase().includes('login necessário')) {
+    throw new Error(`Sinergy retornou: "${result}" (auth/header rejeitado)`);
+  }
+
+  const innerXml = decodeInnerXml(result);
+
+  if (!innerXml.trim().startsWith('<')) {
+    // Pode ser criptografado/base64
+    saveDebugPayload('sinergy_bycpf_result.txt', result);
+    throw new Error(
+      'Result não parece XML após decode. Pode estar criptografado/base64 conforme configuração do Sinergy.'
+    );
+  }
 
   const innerObj = parser.parse(innerXml);
   const raiz = innerObj.Funcionarios ?? innerObj.funcionarios ?? innerObj;
@@ -166,20 +226,35 @@ function parseAtivosCompleto(soapXml) {
     body?.GetDadosFuncionariosAtivosCompletoResponse
       ?.GetDadosFuncionariosAtivosCompletoResult;
 
+  // ⚠️ Aqui é onde hoje você devolve [] e “some” com o erro.
   if (!result || typeof result !== 'string') {
-    logDebug(
-      'GetDadosFuncionariosAtivosCompletoResult ausente ou não-string. Body:',
-      body
+    saveDebugPayload('sinergy_ativos_body.json', JSON.stringify(body, null, 2));
+    throw new Error(
+      'GetDadosFuncionariosAtivosCompletoResult ausente/não-string. Possível mudança de retorno, SOAPAction, ou bloqueio.'
     );
-    return [];
   }
 
-  const innerXml = result
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
+  if (result.toLowerCase().includes('login necessário')) {
+    throw new Error(`Sinergy retornou: "${result}" (auth/header rejeitado)`);
+  }
+
+  // Se vier base64/criptografado (ou gzip-base64) em vez de XML escapado:
+  const trimmed = result.trim();
+  if (!trimmed.includes('&lt;') && !trimmed.startsWith('<') && looksLikeBase64(trimmed)) {
+    saveDebugPayload('sinergy_ativos_result_base64.txt', trimmed.slice(0, 5000));
+    throw new Error(
+      'Result parece base64 (possível retorno criptografado/compactado). Precisaremos tratar esse caso.'
+    );
+  }
+
+  const innerXml = trimmed.startsWith('<') ? trimmed : decodeInnerXml(trimmed);
+
+  if (!innerXml.trim().startsWith('<')) {
+    saveDebugPayload('sinergy_ativos_result.txt', trimmed.slice(0, 8000));
+    throw new Error(
+      'Result não parece XML após decode. Pode estar criptografado/serializado.'
+    );
+  }
 
   const innerObj = parser.parse(innerXml);
   const raiz = innerObj.FuncAtivosCompleto ?? innerObj;
@@ -205,11 +280,9 @@ async function fetchActiveEmployeesFromSinergy() {
   const soapXml = await callSoap(envelope, SINERGY_SOAP_ACTION_ATIVOS);
   const funcionarios = parseAtivosCompleto(soapXml);
 
-  console.log(
-    `✅ [Sinergy] Retornados ${funcionarios.length} funcionários ativos.`
-  );
+  console.log(`✅ [Sinergy] Retornados ${funcionarios.length} funcionários ativos.`);
 
-  if (funcionarios.length > 0) {
+  if (DEBUG && funcionarios.length > 0) {
     const sample = funcionarios.slice(0, 2);
     console.log('🔎 [Sinergy] Sample (first 2):');
     for (const f of sample) {

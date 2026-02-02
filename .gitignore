@@ -1,3 +1,4 @@
 /node_modules
+/debug
 cards_ativos_raw.json
 .env
